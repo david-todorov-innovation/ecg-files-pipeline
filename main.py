@@ -1,4 +1,6 @@
 from google.cloud import storage
+from heapq import merge
+import time
 
 
 def blob_exists(bucket_name, file_name):
@@ -54,10 +56,12 @@ def get_file_writer(bucket_name, file_name):
     writer = blob.open("w")
     return writer
 
+
 def pairwise(iterable):
     """s -> (s0, s1), (s2, s3), (s4, s5), ..."""
     a = iter(iterable)
     return zip(a, a)
+
 
 def calculate_y(x):
     y = (x / 6) + 511
@@ -66,6 +70,7 @@ def calculate_y(x):
     elif y < 0:
         y = 0
     return int(y)
+
 
 def write_to_bucket(event, context):
     """Triggered by a change to a Cloud Storage bucket.
@@ -80,27 +85,12 @@ def write_to_bucket(event, context):
 
     print(f"Processing file: {file['name']}.")
 
-    # creating a file writing stream for a temporary file where the content will be written
-    writer = get_file_writer("merged-formatted-csv-file", "merged-tmp.csv")
-
-    # if a merged file already exists, its contents are written to the temporary file
-    if blob_exists("merged-formatted-csv-file", "merged.csv"):
-        merged_reader = get_file_reader("merged-formatted-csv-file", "merged.csv")
-        while True:
-            line = merged_reader.readline()
-
-            if not line:
-                break
-
-            writer.write(line)
-
-        merged_reader.close()
-
     # creating a read stream for the file that triggered the function
     input_reader = get_file_reader(bucket_name, file['name'])
 
     # reading the file line by line, splitting the lines in pairs and writing each
-    # timestamp,x pair in a separate line in the temporary file.
+    # timestamp,x pair in a list of input file lines.
+    inputFileLines = []
     while True:
         # Get next line from file
         line = input_reader.readline()
@@ -110,25 +100,76 @@ def write_to_bucket(event, context):
             break
 
         words = line.split(",")
-        # counter = 0
         for timestamp, x in pairwise(words):
             if timestamp and x:
                 row = ",".join([timestamp, str(calculate_y(int(x)))])
                 if row.endswith("\n"):
-                    writer.write(row)
+                    inputFileLines.append(row)
+                    # writer.write(row)
                 else:
-                    writer.write(row + "\n")
-                # counter += 1
+                    inputFileLines.append(row + "\n")
+                    # writer.write(row + "\n")
             else:
                 break
 
     input_reader.close()
+    inputFileLines.sort()
+
+    # creating a file writing stream for a temporary file where the content will be written
+    writer = get_file_writer("merged-formatted-csv-file", "merged-tmp.csv")
+
+    # if a merged file already exists, it's merge-sorted with the input file
+    start = time.time()
+    if blob_exists("merged-formatted-csv-file", "merged.csv"):
+        # read stream for reading from the merged file
+        merged_reader = get_file_reader("merged-formatted-csv-file", "merged.csv")
+
+        line = merged_reader.readline()
+
+        while True:
+            # End of file has been reached
+            if not line:
+                # The merged file has been read and written in the merged-tmp file in its entirety.
+                # The rest of the input file lines list should be written to the merged-tmp file.
+                for row in inputFileLines:
+                    writer.write(row)
+                break
+
+            # End of list has been reached
+            if not inputFileLines:
+                # The input file list has been written in the merged-tmp file in its entirey.
+                # The rest of the merged file should be written to the merged-tmp file.
+                writer.write(line)
+                while True:
+                    line = merged_reader.readline()
+                    if not line:
+                        break
+                    writer.write(line)
+                break
+
+            # comparing lines from the file and the list. The smaller line is written to
+            # the output file, and "the pointer" is moved to the next line in the resource.
+            if line < inputFileLines[0]:
+                writer.write(line)
+                line = merged_reader.readline()
+            else:
+                writer.write(inputFileLines.pop(0))
+
+        merged_reader.close()
+    else:
+        # This is the first file that has been sent, so it will
+        # need to be sorted and written to the output bucket
+        for row in inputFileLines:
+            writer.write(row)
+
+    end = time.time()
+    print(f"Sorting took {end - start} seconds")
 
     writer.flush()
     writer.close()
 
-    # If a merged file already existed, its contents are now in the temporary file,
-    # so the merged file is safe to delete.
+    # If a merged file already existed, its contents are now in
+    # the temporary file, so the merged file is safe to delete.
     if blob_exists("merged-formatted-csv-file", "merged.csv"):
         delete_blob("merged-formatted-csv-file", "merged.csv")
 
